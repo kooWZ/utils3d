@@ -425,6 +425,13 @@ def normal_map_edge(normals: ndarray, tol: float, kernel_size: int = 3, mask: nd
     return edge
 
 
+def _cross3_out(a: ndarray, b: ndarray, out: ndarray) -> ndarray:
+    out[..., 0] = a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1]
+    out[..., 1] = a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2]
+    out[..., 2] = a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+    return out
+
+
 @no_warnings(category=RuntimeWarning)
 def point_map_to_normal_map(point: ndarray, mask: ndarray = None, edge_threshold: float = None) -> ndarray:
     """Calculate normal map from point map. Value range is [-1, 1]. 
@@ -444,62 +451,67 @@ def point_map_to_normal_map(point: ndarray, mask: ndarray = None, edge_threshold
         mask = np.ones_like(point[..., 0], dtype=bool)
     mask_pad = np.zeros((height + 2, width + 2), dtype=bool)
     mask_pad[1:-1, 1:-1] = mask
-    mask = mask_pad
 
     pts = np.zeros((height + 2, width + 2, 3), dtype=point.dtype)
     pts[1:-1, 1:-1, :] = point
-    up = pts[:-2, 1:-1, :] - pts[1:-1, 1:-1, :]
-    left = pts[1:-1, :-2, :] - pts[1:-1, 1:-1, :]
-    down = pts[2:, 1:-1, :] - pts[1:-1, 1:-1, :]
-    right = pts[1:-1, 2:, :] - pts[1:-1, 1:-1, :]
-    normal = np.stack([
-        np.cross(up, left, axis=-1),
-        np.cross(left, down, axis=-1),
-        np.cross(down, right, axis=-1),
-        np.cross(right, up, axis=-1),
-    ])
-    normal_norm = np.linalg.norm(normal, axis=-1, keepdims=True)
-    
-    valid = np.stack([
-        mask[:-2, 1:-1] & mask[1:-1, :-2],
-        mask[1:-1, :-2] & mask[2:, 1:-1],
-        mask[2:, 1:-1] & mask[1:-1, 2:],
-        mask[1:-1, 2:] & mask[:-2, 1:-1],
-    ]) & mask[None, 1:-1, 1:-1]
-    if edge_threshold is not None:
-        threshold = np.deg2rad(edge_threshold)
-        if threshold <= 0:
-            valid &= False
-        else:
-            center_point = pts[1:-1, 1:-1, :]
-            dot = (center_point[None, ...] * normal).sum(axis=-1)
-            point_norm_sq = (center_point * center_point).sum(axis=-1)
-            normal_norm_sq = np.square(normal_norm[..., 0])
-            zero_vector = (point_norm_sq[None, ...] == 0) | (normal_norm_sq == 0)
-            if threshold <= np.pi / 2:
+    center_point = pts[1:-1, 1:-1, :]
+    up = pts[:-2, 1:-1, :] - center_point
+    left = pts[1:-1, :-2, :] - center_point
+    down = pts[2:, 1:-1, :] - center_point
+    right = pts[1:-1, 2:, :] - center_point
+
+    direction_pairs = ((up, left), (left, down), (down, right), (right, up))
+    valid_pairs = (
+        mask_pad[:-2, 1:-1] & mask_pad[1:-1, :-2],
+        mask_pad[1:-1, :-2] & mask_pad[2:, 1:-1],
+        mask_pad[2:, 1:-1] & mask_pad[1:-1, 2:],
+        mask_pad[1:-1, 2:] & mask_pad[:-2, 1:-1],
+    )
+    center_valid = mask_pad[1:-1, 1:-1]
+
+    threshold = None if edge_threshold is None else np.deg2rad(edge_threshold)
+    point_norm_sq = None
+    cos_threshold_sq = None
+    if threshold is not None and 0 < threshold <= np.pi / 2:
+        point_norm_sq = (center_point * center_point).sum(axis=-1)
+        cos_threshold_sq = np.cos(threshold) ** 2
+
+    normal_dtype = np.result_type(point.dtype, np.float32)
+    normal = np.empty(center_point.shape, dtype=normal_dtype)
+    normal_sum = np.zeros(center_point.shape, dtype=normal_dtype)
+    normal_mask = np.zeros((height, width), dtype=bool)
+
+    for (direction_a, direction_b), valid_pair in zip(direction_pairs, valid_pairs):
+        _cross3_out(direction_a, direction_b, normal)
+        normal_norm = np.linalg.norm(normal, axis=-1, keepdims=True)
+        valid = valid_pair & center_valid
+
+        if threshold is not None:
+            if threshold <= 0:
+                valid &= False
+            elif threshold <= np.pi / 2:
+                dot = (center_point * normal).sum(axis=-1)
+                normal_norm_sq = np.square(normal_norm[..., 0])
+                zero_vector = (point_norm_sq == 0) | (normal_norm_sq == 0)
                 lhs = dot * dot
-                rhs = point_norm_sq[None, ...] * normal_norm_sq * (np.cos(threshold) ** 2)
+                rhs = point_norm_sq * normal_norm_sq * cos_threshold_sq
                 view_valid = zero_vector | (lhs > rhs)
-                eps = max(np.finfo(center_point.dtype).eps * 64, 1e-12)
-                scale = np.maximum(np.maximum(lhs, rhs), np.finfo(center_point.dtype).tiny)
+                eps = max(np.finfo(normal_dtype).eps * 64, 1e-12)
+                scale = np.maximum(np.maximum(lhs, rhs), np.finfo(normal_dtype).tiny)
                 boundary = valid & ~zero_vector & (np.abs(lhs - rhs) <= eps * scale)
-            else:
-                view_valid = np.ones_like(valid, dtype=bool)
-                boundary = np.zeros_like(valid, dtype=bool)
-            if np.any(boundary):
-                point_boundary = np.broadcast_to(center_point[None, ...], normal.shape)[boundary]
-                normal_boundary = normal[boundary]
-                view_angle = angle_between(point_boundary, normal_boundary)
-                view_angle = np.minimum(view_angle, np.pi - view_angle)
-                view_valid[boundary] = view_angle < threshold
-            valid &= view_valid
-    
-    normal = normal / (normal_norm + 1e-12)
-    normal = np.where(valid[..., None], normal, 0).sum(axis=0)
-    normal = normal / (np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-12)
+                if np.any(boundary):
+                    view_angle = angle_between(center_point[boundary], normal[boundary])
+                    view_angle = np.minimum(view_angle, np.pi - view_angle)
+                    view_valid[boundary] = view_angle < threshold
+                valid &= view_valid
+
+        normal /= normal_norm + 1e-12
+        np.add(normal_sum, normal, out=normal_sum, where=valid[..., None])
+        normal_mask |= valid
+
+    normal = normal_sum / (np.linalg.norm(normal_sum, axis=-1, keepdims=True) + 1e-12)
     
     if has_mask:
-        normal_mask =  valid.any(axis=0)
         normal = np.where(normal_mask[..., None], normal, 0)
         return normal, normal_mask
     else:
