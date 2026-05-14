@@ -458,7 +458,7 @@ def point_map_to_normal_map(point: ndarray, mask: ndarray = None, edge_threshold
         np.cross(down, right, axis=-1),
         np.cross(right, up, axis=-1),
     ])
-    normal = normal / (np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-12)
+    normal_norm = np.linalg.norm(normal, axis=-1, keepdims=True)
     
     valid = np.stack([
         mask[:-2, 1:-1] & mask[1:-1, :-2],
@@ -467,11 +467,35 @@ def point_map_to_normal_map(point: ndarray, mask: ndarray = None, edge_threshold
         mask[1:-1, 2:] & mask[:-2, 1:-1],
     ]) & mask[None, 1:-1, 1:-1]
     if edge_threshold is not None:
-        view_angle = angle_between(pts[None, 1:-1, 1:-1, :], normal)
-        view_angle = np.minimum(view_angle, np.pi - view_angle)
-        valid = valid & (view_angle < np.deg2rad(edge_threshold))
+        threshold = np.deg2rad(edge_threshold)
+        if threshold <= 0:
+            valid &= False
+        else:
+            center_point = pts[1:-1, 1:-1, :]
+            dot = (center_point[None, ...] * normal).sum(axis=-1)
+            point_norm_sq = (center_point * center_point).sum(axis=-1)
+            normal_norm_sq = np.square(normal_norm[..., 0])
+            zero_vector = (point_norm_sq[None, ...] == 0) | (normal_norm_sq == 0)
+            if threshold <= np.pi / 2:
+                lhs = dot * dot
+                rhs = point_norm_sq[None, ...] * normal_norm_sq * (np.cos(threshold) ** 2)
+                view_valid = zero_vector | (lhs > rhs)
+                eps = max(np.finfo(center_point.dtype).eps * 64, 1e-12)
+                scale = np.maximum(np.maximum(lhs, rhs), np.finfo(center_point.dtype).tiny)
+                boundary = valid & ~zero_vector & (np.abs(lhs - rhs) <= eps * scale)
+            else:
+                view_valid = np.ones_like(valid, dtype=bool)
+                boundary = np.zeros_like(valid, dtype=bool)
+            if np.any(boundary):
+                point_boundary = np.broadcast_to(center_point[None, ...], normal.shape)[boundary]
+                normal_boundary = normal[boundary]
+                view_angle = angle_between(point_boundary, normal_boundary)
+                view_angle = np.minimum(view_angle, np.pi - view_angle)
+                view_valid[boundary] = view_angle < threshold
+            valid &= view_valid
     
-    normal = (normal * valid[..., None]).sum(axis=0)
+    normal = normal / (normal_norm + 1e-12)
+    normal = np.where(valid[..., None], normal, 0).sum(axis=0)
     normal = normal / (np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-12)
     
     if has_mask:
@@ -516,6 +540,17 @@ def depth_map_to_point_map(
     """
     assert intrinsics is not None, "intrinsics matrix is required"
     uv = uv_map(depth.shape[-2:], dtype=depth.dtype)
+    if extrinsics is None and depth.ndim == 2 and intrinsics.shape == (3, 3):
+        transform = np.block([
+            [intrinsics, np.zeros((*intrinsics.shape[:-2], 3, 1), dtype=intrinsics.dtype)],
+            [np.array([[0, 0, 0, 1]], dtype=intrinsics.dtype)],
+        ])
+        points = np.concatenate([uv, np.ones((*uv.shape[:-1], 1), dtype=uv.dtype)], axis=-1) * depth[..., None]
+        points = np.concatenate([points, np.ones((*points.shape[:-1], 1), dtype=uv.dtype)], axis=-1)
+        points = points @ np.linalg.inv(transform).swapaxes(-2, -1)
+        points = points[..., :3]
+        return points
+
     points = unproject_cv(
         uv, 
         depth, 
